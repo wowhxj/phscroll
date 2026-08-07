@@ -44,6 +44,8 @@ Tips:
 The following elisp enables horizontal scrolling in Markdown tables while leaving line wrapping enabled elsewhere. It supports both =markdown-mode= tables with leading pipes and =gfm-mode= tables without leading pipes.
 
 #+begin_src emacs-lisp
+;; Recommended for scaled CJK or mixed-pitch fonts.
+(setq phscroll-calculate-in-pixels t)
 (with-eval-after-load "markdown-mode"
   (require 'markdown-phscroll))
 #+end_src

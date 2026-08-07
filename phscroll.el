@@ -573,7 +573,7 @@ Respects the customization variables
         (goto-char
          (+ (phscroll-line-begin)
             (phscroll-string-length
-             (car (phscroll-substring-over-width
+             (car (phscroll-substring-over-display-width
                    (phscroll-current-line-string)
                    (+ (phscroll-column (point))
                       delta)))))))
@@ -581,7 +581,7 @@ Respects the customization variables
         (goto-char
          (+ (phscroll-line-begin)
             (phscroll-string-length
-             (car (phscroll-substring-over-width
+             (car (phscroll-substring-over-display-width
                    (phscroll-current-line-string)
                    (max 0 (+ (phscroll-column (point)) delta)))))))))))
 
@@ -590,9 +590,12 @@ Respects the customization variables
 (defun phscroll-column (pos)
   "Return the horizontal position of POS."
   ;; TODO: `current-column'との違いは？ `phscroll-ignored-invisibility-specs'の扱いくらい？
-  (phscroll-string-width
-   (phscroll-buffer-substring
-    (phscroll-line-begin pos) pos)))
+  (let ((line-beg (phscroll-line-begin pos)))
+    (if phscroll-calculate-in-pixels
+        (/ (phscroll-text-pixel-width line-beg pos)
+           (float (frame-char-width)))
+      (phscroll-string-width
+       (phscroll-buffer-substring line-beg pos)))))
 
 (defun phscroll-show-point (pos)
   "If POS is within a scroll area, horizontally scroll the area so that POS
@@ -1387,8 +1390,12 @@ WINDOW is the window to display in; nil means the selected window."
          (line-overlays (phscroll-get-overlay-cache line-begin line-end))
          ;; left invisible
          (left-limit-width scroll-column)
-         (left-str-width (phscroll-substring-over-width
-                          line-str left-limit-width line-overlays)) ;; TODO: phscroll-calculate-in-pixels case
+         (left-str-width
+          (if phscroll-calculate-in-pixels
+              (phscroll-substring-over-width-px
+               line-str left-limit-width)
+            (phscroll-substring-over-width
+             line-str left-limit-width line-overlays)))
          (left-str (car left-str-width))
          (left-width (cdr left-str-width)) ;; 0 ~ left-limit-width + overflow
          (left-overflow (max 0 (- left-width scroll-column))) ;; 0 ~ overflow
@@ -1415,9 +1422,9 @@ WINDOW is the window to display in; nil means the selected window."
     (phscroll-add-line-veils
      line-begin line-end
      left-len
-     left-overflow
+     (max 0 left-overflow)
      middle-len
-     middle-shortage)))
+     (max 0 middle-shortage))))
 
 (defun phscroll-remove-line-veils (line-begin line-end)
   (phscroll-remove-line-veils-region line-begin
@@ -1432,6 +1439,12 @@ WINDOW is the window to display in; nil means the selected window."
   ;;#'phscroll-remove-line-veils-region--textprop) ;; Experimental
   #'phscroll-remove-line-veils-region--overlay)
 
+(defun phscroll-space-string (width)
+  "Return display text occupying WIDTH columns."
+  (if (> width 0)
+      (propertize " " 'display `(space :width ,width))
+    ""))
+
 (defun phscroll-add-line-veils--overlay (line-begin
                                          line-end
                                          left-len
@@ -1443,7 +1456,7 @@ WINDOW is the window to display in; nil means the selected window."
       (overlay-put ov 'display (if phscroll-use-fringe
                                    '(left-fringe left-arrow)
                                  "<"))
-      (overlay-put ov 'after-string (make-string left-overflow ?\s))
+      (overlay-put ov 'after-string (phscroll-space-string left-overflow))
       (overlay-put ov 'phscroll t)
       ;;(overlay-put ov 'phscroll-left t)
       (overlay-put ov 'phscroll-line-veil t)
@@ -1455,7 +1468,7 @@ WINDOW is the window to display in; nil means the selected window."
       (overlay-put ov 'display
                    (if phscroll-use-fringe
                        '(right-fringe right-arrow)
-                     (concat (make-string middle-shortage ?\s) ">")))
+                     (concat (phscroll-space-string middle-shortage) ">")))
       (overlay-put ov 'phscroll t)
       ;;(overlay-put ov 'phscroll-right t)
       (overlay-put ov 'phscroll-line-veil t)
@@ -1867,17 +1880,54 @@ Return value format: (RESULT-STR . RESULT-STR-WIDTH)"
          (width (cdr pos-and-width)))
 
     (cons (cons beg pos)
-          (/ (+ width (frame-char-width) -1) (frame-char-width)))))
+          (/ width (float (frame-char-width))))))
+
+(defun phscroll-substring-over-width-px (str end-column)
+  "Return the shortest prefix of STR covering END-COLUMN display columns."
+  (let* ((beg (car str))
+         (end (cdr str))
+         (target-width (* (frame-char-width) end-column))
+         (pos-and-width
+          (phscroll-find-max-pos-fits-in-width-px beg end target-width))
+         (pos (car pos-and-width))
+         (width (cdr pos-and-width)))
+    (when (and (< width target-width) (< pos end))
+      (setq pos (1+ pos)
+            width (phscroll-text-pixel-width beg pos)))
+    (cons (cons beg pos)
+          (/ width (float (frame-char-width))))))
+
+(defun phscroll-substring-over-display-width (str end-column)
+  "Return the shortest prefix of STR covering END-COLUMN display columns."
+  (if phscroll-calculate-in-pixels
+      (phscroll-substring-over-width-px str end-column)
+    (phscroll-substring-over-width str end-column)))
+
+(defun phscroll-text-pixel-width (beg end &optional window)
+  "Return the rendered width in pixels between BEG and END in WINDOW."
+  (cdr (phscroll-find-max-pos-fits-in-width-px
+        beg end most-positive-fixnum window)))
 
 (defun phscroll-find-max-pos-fits-in-width-px (beg end width &optional window)
-  ;; Temporarily unveil folded text
-  (let ((overlays (cl-loop for ov in (overlays-in beg end)
-                           for invis = (overlay-get ov 'invisible)
-                           when (phscroll-ignored-invisibility-spec-p invis)
-                           collect (progn
-                                     ;; TODO: (if (listp invis) (seq-difference invis phscroll-ignored-invisibility-specs) nil)?
-                                     (overlay-put ov 'invisible nil)
-                                     (cons ov invis)))))
+  ;; Temporarily unveil folded text and phscroll's own display overlays.
+  (let* ((all-overlays (overlays-in beg end))
+         (invisible-overlays
+          (cl-loop for ov in all-overlays
+                   for invis = (overlay-get ov 'invisible)
+                   when (phscroll-ignored-invisibility-spec-p invis)
+                   collect (progn
+                             ;; TODO: (if (listp invis) (seq-difference invis phscroll-ignored-invisibility-specs) nil)?
+                             (overlay-put ov 'invisible nil)
+                             (cons ov invis))))
+         (veil-overlays
+          (cl-loop for ov in all-overlays
+                   when (overlay-get ov 'phscroll-line-veil)
+                   collect (prog1
+                               (list ov
+                                     (overlay-get ov 'display)
+                                     (overlay-get ov 'after-string))
+                             (overlay-put ov 'display nil)
+                             (overlay-put ov 'after-string nil)))))
     (unwind-protect
         (let ((lower beg)
               (upper (1+ end)) ;; Possible answers include END
@@ -1893,9 +1943,11 @@ Return value format: (RESULT-STR . RESULT-STR-WIDTH)"
                         lower-width pos-width)
                 (setq upper pos))))
           (cons lower (or lower-width 0)))
-      ;; Recover invisible property
-      (dolist (ov-invis overlays)
-        (overlay-put (car ov-invis) 'invisible (cdr ov-invis))))))
+      (dolist (ov-invis invisible-overlays)
+        (overlay-put (car ov-invis) 'invisible (cdr ov-invis)))
+      (dolist (ov-props veil-overlays)
+        (overlay-put (nth 0 ov-props) 'display (nth 1 ov-props))
+        (overlay-put (nth 0 ov-props) 'after-string (nth 2 ov-props))))))
 
 
 
