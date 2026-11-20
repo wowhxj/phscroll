@@ -1220,7 +1220,8 @@ This is the implementation of `phscroll-mwheel-scroll-left' and
    ;; org-table-overlay-coordinates uses this.
    (let ((bol (phscroll-line-begin pos)))
      (cl-loop for ov in (overlays-at bol)
-              sum (length (and (equal (overlay-start ov) bol)
+              sum (length (and (not (overlay-get ov 'phscroll))
+                                (equal (overlay-start ov) bol)
                                (overlay-get ov 'before-string)))))))
 
 (defun phscroll-window-width (&optional window)
@@ -1370,6 +1371,24 @@ scroll AREA."
       ;; Return the end of the actual updated range
       (point))))
 
+(defun phscroll-alignment-column (pos)
+  "Return the absolute column of a numeric alignment space at POS."
+  (pcase (get-text-property pos 'display)
+    (`(space :align-to ,(and (pred numberp) column)) column)))
+
+(defun phscroll-offset-alignment-spaces (beg end scroll-column)
+  "Shift alignment spaces in the visible range BEG to END by SCROLL-COLUMN."
+  (while (< beg end)
+    (let ((next (next-single-property-change beg 'display nil end))
+          (column (phscroll-alignment-column beg)))
+      (when column
+        (let ((ov (make-overlay beg next)))
+          (overlay-put ov 'display `(space :align-to ,(+ (- column scroll-column)
+                                                        (if phscroll-use-fringe 0 1))))
+          (overlay-put ov 'phscroll-line-veil t)
+          (overlay-put ov 'phscroll t)))
+      (setq beg next))))
+
 (defun phscroll-update-current-line-display (line-begin line-end
                                                         scroll-column window)
   "Update the display of a single line within a scroll area.
@@ -1403,28 +1422,31 @@ WINDOW is the window to display in; nil means the selected window."
          ;; middle visible
          (middle-limit-width (- window-width left-overflow))
          (middle-str-width
+          ;; Absolute alignment spaces are measured from the line origin.
           (if phscroll-calculate-in-pixels
               (phscroll-truncate-string-to-width-px
-               (phscroll-substring line-str left-len) middle-limit-width)
+               line-str (+ scroll-column window-width))
             (phscroll-truncate-string-to-width
-             (phscroll-substring line-str left-len) middle-limit-width
-             line-overlays)))
-         (middle-str (car middle-str-width))
-         (middle-width (cdr middle-str-width))
+             line-str (+ scroll-column window-width) line-overlays)))
+         (middle-width (- (cdr middle-str-width) left-width))
          (middle-shortage (- middle-limit-width middle-width))
-         (middle-len (phscroll-string-length middle-str)))
+         (middle-len (max 0 (- (phscroll-string-length (car middle-str-width)) left-len))))
 
     (phscroll-log "Update Line: %s~%s len:%s:%s width:%s:%s"
                   line-begin line-end
                   left-len middle-len
                   left-width middle-width)
 
+    (when (> scroll-column 0)
+      (phscroll-offset-alignment-spaces (+ line-begin left-len)
+                                        (+ line-begin left-len middle-len)
+                                        scroll-column))
     (phscroll-add-line-veils
      line-begin line-end
      left-len
-     (max 0 left-overflow)
+     (min window-width (max 0 left-overflow))
      middle-len
-     (max 0 middle-shortage))))
+     (if (> left-overflow window-width) 0 (max 0 middle-shortage)))))
 
 (defun phscroll-remove-line-veils (line-begin line-end)
   (phscroll-remove-line-veils-region line-begin
@@ -1453,10 +1475,14 @@ WINDOW is the window to display in; nil means the selected window."
                                          middle-shortage)
   (when (> left-len 0)
     (let ((ov (make-overlay line-begin (+ line-begin left-len))))
-      (overlay-put ov 'display (if phscroll-use-fringe
-                                   '(left-fringe left-arrow)
-                                 "<"))
-      (overlay-put ov 'after-string (phscroll-space-string left-overflow))
+      (let ((indicator (if phscroll-use-fringe '(left-fringe left-arrow) "<")))
+        (if (> left-overflow 0)
+            (progn
+              (overlay-put ov 'before-string (if phscroll-use-fringe
+                                                 (propertize " " 'display indicator)
+                                               indicator))
+              (overlay-put ov 'display `(space :width ,left-overflow)))
+          (overlay-put ov 'display indicator)))
       (overlay-put ov 'phscroll t)
       ;;(overlay-put ov 'phscroll-left t)
       (overlay-put ov 'phscroll-line-veil t)
@@ -1694,7 +1720,7 @@ should be ignored."
 
 ;;;;; Character Width Calculation
 
-(defun phscroll-char-width-next (pos cache)
+(defun phscroll-char-width-next (pos cache &optional column)
   "Return the width of the character at POS and the position of the next
 character.
 
@@ -1721,9 +1747,10 @@ Overlays and text properties are taken into account as much as possible."
 
      ;; display text property
      ((setq display (get-text-property pos 'display))
-      (cons
-       (phscroll-display-property-width display)
-       (1+ pos)))
+      (if-let* ((target (phscroll-alignment-column pos)))
+          (cons (max 0 (- target (or column 0)))
+                (next-single-property-change pos 'display nil (point-max)))
+        (cons (phscroll-display-property-width display) (1+ pos))))
      ;; invisible text property
      ((setq invisible (get-text-property pos 'invisible))
       (cons
@@ -1796,7 +1823,7 @@ this function calls `phscroll-get-overlay-cache' internally."
         (pos beg)
         (cache (or cache-arg (phscroll-get-overlay-cache beg end))))
     (while (< pos end)
-      (let ((width-next (phscroll-char-width-next pos cache)))
+      (let ((width-next (phscroll-char-width-next pos cache width)))
         (setq width (+ width (car width-next)))
         (setq pos (cdr width-next))))
     width))
@@ -1831,7 +1858,7 @@ this function calls `phscroll-get-overlay-cache' internally."
          (prev-pos pos)
          (cache (or cache-arg (phscroll-get-overlay-cache beg end))))
     (while (and (< pos end) (<= width end-column))
-      (let ((width-next (phscroll-char-width-next pos cache)))
+      (let ((width-next (phscroll-char-width-next pos cache width)))
         (setq prev-pos pos)
         (setq prev-width width)
         (setq width (+ width (car width-next)))
@@ -1863,7 +1890,7 @@ Return value format: (RESULT-STR . RESULT-STR-WIDTH)"
          (pos beg)
          (cache (or cache-arg (phscroll-get-overlay-cache beg end))))
     (while (and (< pos end) (< width end-column))
-      (let ((width-next (phscroll-char-width-next pos cache)))
+      (let ((width-next (phscroll-char-width-next pos cache width)))
         (setq width (+ width (car width-next)))
         (setq pos (cdr width-next))))
     (cons (cons beg pos) width)))
@@ -1894,6 +1921,11 @@ Return value format: (RESULT-STR . RESULT-STR-WIDTH)"
     (when (and (< width target-width) (< pos end))
       (setq pos (1+ pos)
             width (phscroll-text-pixel-width beg pos)))
+    ;; Measuring any part of a stretch space includes its entire glyph.
+    (when (and (> pos beg) (< pos end) (phscroll-alignment-column (1- pos))
+               (eq (get-text-property (1- pos) 'display)
+                   (get-text-property pos 'display)))
+      (setq pos (next-single-property-change pos 'display nil end)))
     (cons (cons beg pos)
           (/ width (float (frame-char-width))))))
 
@@ -1925,7 +1957,9 @@ Return value format: (RESULT-STR . RESULT-STR-WIDTH)"
                    collect (prog1
                                (list ov
                                      (overlay-get ov 'display)
-                                     (overlay-get ov 'after-string))
+                                     (overlay-get ov 'after-string)
+                                     (overlay-get ov 'before-string))
+                             (overlay-put ov 'before-string nil)
                              (overlay-put ov 'display nil)
                              (overlay-put ov 'after-string nil)))))
     (unwind-protect
@@ -1946,6 +1980,7 @@ Return value format: (RESULT-STR . RESULT-STR-WIDTH)"
       (dolist (ov-invis invisible-overlays)
         (overlay-put (car ov-invis) 'invisible (cdr ov-invis)))
       (dolist (ov-props veil-overlays)
+        (overlay-put (nth 0 ov-props) 'before-string (nth 3 ov-props))
         (overlay-put (nth 0 ov-props) 'display (nth 1 ov-props))
         (overlay-put (nth 0 ov-props) 'after-string (nth 2 ov-props))))))
 

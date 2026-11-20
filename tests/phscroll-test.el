@@ -90,5 +90,25 @@
 			 (= (overlay-end ov) (+ line-beg 2))))
 		  (overlays-in line-beg line-end)))))))
 
+(ert-deftest phscroll-shifts-visible-alignment-spaces ()
+  (with-temp-buffer
+    (insert "abcdef" (propertize "    " 'display '(space :align-to 12)) "|xyz")
+    (goto-char (point-min))
+    (let ((phscroll-calculate-in-pixels nil)
+          (phscroll-use-fringe t))
+      (cl-letf (((symbol-function 'phscroll-window-width-at)
+                 (lambda (_pos _window) 10)))
+        (phscroll-update-current-line-display (point-min) (point-max) 3 nil)
+        (should (equal (get-char-property 7 'display) '(space :align-to 9)))
+        (should-not (get-char-property 11 'display)) ; Final visible pipe.
+        (should (equal (get-char-property 12 'display) '(right-fringe right-arrow)))
+        (phscroll-remove-line-veils (point-min) (point-max))
+        (phscroll-update-current-line-display (point-min) (point-max) 8 nil)
+        (let ((veil (cl-find-if (lambda (ov) (overlay-get ov 'phscroll-line-veil))
+                                (overlays-at (point-min)))))
+          (should (= (overlay-end veil) 11))
+          (should (equal (overlay-get veil 'display)
+                         '(space :width 4))))))))
+
 (provide 'phscroll-test)
 ;;; phscroll-test.el ends here
